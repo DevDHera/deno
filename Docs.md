@@ -217,7 +217,7 @@ import { test, assertEqual } from "./package.ts";
 ```
 
 This design circumvents a plethora of complexity spawned by package management
-software, centralized code repositories, and superfluous file formates.
+software, centralized code repositories, and superfluous file formats.
 
 ## Useful command line flags
 
@@ -230,6 +230,8 @@ are a few particularly useful ones:
 
 ## How to Profile deno
 
+To start profiling,
+
 ```sh
 # Make sure we're only building release.
 export DENO_BUILD_MODE=release
@@ -240,11 +242,64 @@ export DENO_BUILD_MODE=release
 # Exercise it.
 third_party/wrk/linux/wrk http://localhost:4500/
 kill `pgrep deno`
-# When supplying --prof, V8 will write a file in the current directory that
-# looks like this isolate-0x7fad98242400-v8.log
-# To examine this file:
+```
+
+V8 will write a file in the current directory that looks like this:
+`isolate-0x7fad98242400-v8.log`. To examine this file:
+
+```sh
 D8_PATH=target/release/ ./third_party/v8/tools/linux-tick-processor
-isolate-0x7fad98242400-v8.log
+isolate-0x7fad98242400-v8.log > prof.log
+# on macOS, use ./third_party/v8/tools/mac-tick-processor instead
+```
+
+`prof.log` will contain information about tick distribution of different calls.
+
+To view the log with Web UI, generate JSON file of the log:
+
+```sh
+D8_PATH=target/release/ ./third_party/v8/tools/linux-tick-processor
+isolate-0x7fad98242400-v8.log --preprocess > prof.json
+```
+
+Open `third_party/v8/tools/profview/index.html` in your brower, and select
+`prof.json` to view the distribution graphically.
+
+To learn more about `d8` and profiling, check out the following links:
+
+- [https://v8.dev/docs/d8](https://v8.dev/docs/d8)
+- [https://v8.dev/docs/profile](https://v8.dev/docs/profile)
+
+## How to Debug deno
+
+We can use LLDB to debug deno.
+
+```sh
+lldb -- target/debug/deno tests/worker.js
+> run
+> bt
+> up
+> up
+> l
+```
+
+To debug Rust code, we can use `rust-lldb`. It should come with `rustc` and is a
+wrapper around LLDB.
+
+```sh
+rust-lldb -- ./target/debug/deno tests/http_bench.ts --allow-net
+# On macOS, you might get warnings like
+# `ImportError: cannot import name _remove_dead_weakref`
+# In that case, use system python by setting PATH, e.g.
+# PATH=/System/Library/Frameworks/Python.framework/Versions/2.7/bin:$PATH
+(lldb) command script import "/Users/kevinqian/.rustup/toolchains/1.30.0-x86_64-apple-darwin/lib/rustlib/etc/lldb_rust_formatters.py"
+(lldb) type summary add --no-value --python-function lldb_rust_formatters.print_val -x ".*" --category Rust
+(lldb) type category enable Rust
+(lldb) target create "../deno/target/debug/deno"
+Current executable set to '../deno/target/debug/deno' (x86_64).
+(lldb) settings set -- target.run-args  "tests/http_bench.ts" "--allow-net"
+(lldb) b op_start
+(lldb) r
 ```
 
 ## Build Instructions _(for advanced users only)_
@@ -254,7 +309,7 @@ isolate-0x7fad98242400-v8.log
 To ensure reproducible builds, deno has most of its dependencies in a git
 submodule. However, you need to install separately:
 
-1. [Rust](https://www.rust-lang.org/en-US/install.html)
+1. [Rust](https://www.rust-lang.org/en-US/install.html) >= 1.30.0
 2. [Node](https://nodejs.org/)
 3. Python 2.
    [Not 3](https://github.com/denoland/deno/issues/464#issuecomment-411795578).
@@ -298,7 +353,7 @@ Other useful commands:
     # List executable targets.
     ./third_party/depot_tools/gn ls target/debug //:* --as=output --type=executable
 
-    # List build configuation.
+    # List build configuration.
     ./third_party/depot_tools/gn args target/debug/ --list
 
     # Edit build configuration.
@@ -332,12 +387,38 @@ We use Flatbuffers to define common structs and enums between TypeScript and
 Rust. These common data structures are defined in
 https://github.com/denoland/deno/blob/master/src/msg.fbs
 
+### Internal: Updating prebuilt binaries
+
+V8 takes a long time to build - on the order of an hour. We use pre-built V8
+libraries stored in a Google Storage bucket instead of rebuilding it from
+scratch each time. Our build system is however setup such that we can build V8
+as part of the Deno build if necessary (useful for debugging or changing various
+configurations in V8, or building the pre-built binaries themselves). To control
+whether to use a pre-built V8 or not use the `use_v8_prebuilt` GN argument.
+
+Use `tools/gcloud_upload.py` to upload new prebuilt files.
+
 ## Contributing
 
 See
 [CONTRIBUTING.md](https://github.com/denoland/deno/blob/master/.github/CONTRIBUTING.md).
 
-## Change Log
+## Changelog
+
+### 2018.11.27 / v0.2.0 / Mildly usable
+
+[An intro talk was recorded.](https://www.youtube.com/watch?v=FlTG0UXRAkE)
+
+Stability and usability improvements. `fetch()` is 90% functional now. Basic
+REPL support was added. Shebang support was added. Command-line argument parsing
+was improved. A forwarding service `https://deno.land/x` was set up for Deno
+code. Example code has been posted to
+[deno.land/x/examples](https://github.com/denoland/deno_examples) and
+[deno.land/x/net](https://github.com/denoland/net).
+
+The resources table was added to abstract various types of I/O streams and other
+allocated state. A resource is an integer identifier which maps to some Rust
+object. It can be used with various ops, particularly read and write.
 
 ### 2018.10.18 / v0.1.8 / Connecting to Tokio / Fleshing out APIs
 

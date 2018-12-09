@@ -5,7 +5,9 @@ use errors::DenoResult;
 use errors::ErrorKind;
 use fs as deno_fs;
 use http_util;
+use js_errors::SourceMapGetter;
 use msg;
+
 use ring;
 use std;
 use std::fmt::Write;
@@ -41,16 +43,13 @@ impl DenoDir {
   // https://github.com/denoland/deno/blob/golang/deno_dir.go#L99-L111
   pub fn new(
     reload: bool,
-    custom_root: Option<&Path>,
+    custom_root: Option<PathBuf>,
   ) -> std::io::Result<Self> {
     // Only setup once.
     let home_dir = dirs::home_dir().expect("Could not get home directory.");
     let default = home_dir.join(".deno");
 
-    let root: PathBuf = match custom_root {
-      None => default,
-      Some(path) => path.to_path_buf(),
-    };
+    let root: PathBuf = custom_root.unwrap_or(default);
     let gen = root.as_path().join("gen");
     let deps = root.as_path().join("deps");
     let deps_http = deps.join("http");
@@ -153,8 +152,12 @@ impl DenoDir {
       (source, map_content_type(&p, Some(&content_type)))
     } else {
       let source = fs::read_to_string(&p)?;
-      let content_type = fs::read_to_string(&mt)?;
-      (source, map_content_type(&p, Some(&content_type)))
+      // .mime file might not exists with bundled deps
+      let maybe_content_type_string = fs::read_to_string(&mt).ok();
+      // Option<String> -> Option<&str>
+      let maybe_content_type_str =
+        maybe_content_type_string.as_ref().map(String::as_str);
+      (source, map_content_type(&p, maybe_content_type_str))
     };
     Ok(src)
   }
@@ -349,6 +352,24 @@ impl DenoDir {
   }
 }
 
+impl SourceMapGetter for DenoDir {
+  fn get_source_map(&self, script_name: &str) -> Option<String> {
+    match self.code_fetch(script_name, ".") {
+      Err(_e) => {
+        return None;
+      }
+      Ok(out) => match out.maybe_source_map {
+        None => {
+          return None;
+        }
+        Some(source_map) => {
+          return Some(source_map);
+        }
+      },
+    }
+  }
+}
+
 fn get_cache_filename(basedir: &Path, url: &Url) -> PathBuf {
   let host = url.host_str().unwrap();
   let host_port = match url.port() {
@@ -390,8 +411,8 @@ pub struct CodeFetchOutput {
 #[cfg(test)]
 pub fn test_setup() -> (TempDir, DenoDir) {
   let temp_dir = TempDir::new().expect("tempdir fail");
-  let deno_dir =
-    DenoDir::new(false, Some(temp_dir.path())).expect("setup fail");
+  let deno_dir = DenoDir::new(false, Some(temp_dir.path().to_path_buf()))
+    .expect("setup fail");
   (temp_dir, deno_dir)
 }
 
@@ -479,6 +500,56 @@ macro_rules! add_root {
       $path
     }
   };
+}
+
+#[test]
+fn test_fetch_remote_source_1() {
+  use tokio_util;
+  // http_util::fetch_sync_string requires tokio
+  tokio_util::init(|| {
+    let (_temp_dir, deno_dir) = test_setup();
+    let module_name = "http://localhost:4545/tests/subdir/mt_video_mp2t.t3.ts";
+    let filename = deno_fs::normalize_path(
+      deno_dir
+        .deps_http
+        .join("localhost_PORT4545/tests/subdir/mt_video_mp2t.t3.ts")
+        .as_ref(),
+    );
+    let mime_file_name = format!("{}.mime", &filename);
+
+    let result = deno_dir.fetch_remote_source(module_name, &filename);
+    assert!(result.is_ok());
+    let r = result.unwrap();
+    assert_eq!(&(r.0), "export const loaded = true;\n");
+    assert_eq!(&(r.1), &msg::MediaType::TypeScript);
+    assert_eq!(fs::read_to_string(&mime_file_name).unwrap(), "video/mp2t");
+
+    // Modify .mime, make sure still read from local
+    let _ = fs::write(&mime_file_name, "text/javascript");
+    let result2 = deno_dir.fetch_remote_source(module_name, &filename);
+    assert!(result2.is_ok());
+    let r2 = result2.unwrap();
+    assert_eq!(&(r2.0), "export const loaded = true;\n");
+    // Not MediaType::TypeScript due to .mime modification
+    assert_eq!(&(r2.1), &msg::MediaType::JavaScript);
+  });
+}
+
+#[test]
+fn test_fetch_remote_source_2() {
+  // only local, no http_util::fetch_sync_string called
+  let (_temp_dir, deno_dir) = test_setup();
+  let cwd = std::env::current_dir().unwrap();
+  let cwd_string = cwd.to_str().unwrap();
+  let module_name = "http://example.com/mt_text_typescript.t1.ts"; // not used
+  let filename =
+    format!("{}/tests/subdir/mt_text_typescript.t1.ts", &cwd_string);
+
+  let result = deno_dir.fetch_remote_source(module_name, &filename);
+  assert!(result.is_ok());
+  let r = result.unwrap();
+  assert_eq!(&(r.0), "export const loaded = true;\n");
+  assert_eq!(&(r.1), &msg::MediaType::TypeScript);
 }
 
 #[test]
@@ -948,14 +1019,11 @@ fn filter_shebang(code: String) -> String {
   if !code.starts_with("#!") {
     return code;
   }
-  match code.find('\n') {
-    None => {
-      return String::from("");
-    }
-    Some(i) => {
-      let (_, rest) = code.split_at(i);
-      return String::from(rest);
-    }
+  if let Some(i) = code.find('\n') {
+    let (_, rest) = code.split_at(i);
+    String::from(rest)
+  } else {
+    String::from("")
   }
 }
 

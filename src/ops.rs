@@ -7,6 +7,7 @@ use isolate::Buf;
 use isolate::Isolate;
 use isolate::IsolateState;
 use isolate::Op;
+use libdeno;
 use msg;
 use msg_util;
 use resources;
@@ -23,6 +24,7 @@ use remove_dir_all::remove_dir_all;
 use repl;
 use resources::table_entries;
 use std;
+use std::convert::From;
 use std::fs;
 use std::net::{Shutdown, SocketAddr};
 #[cfg(unix)]
@@ -33,7 +35,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 use tokio;
@@ -47,10 +48,10 @@ type OpResult = DenoResult<Buf>;
 // TODO Ideally we wouldn't have to box the Op being returned.
 // The box is just to make it easier to get a prototype refactor working.
 type OpCreator =
-  fn(state: &Arc<IsolateState>, base: &msg::Base, data: &'static mut [u8])
+  fn(state: &IsolateState, base: &msg::Base, data: libdeno::deno_buf)
     -> Box<Op>;
 
-// Hopefully Rust optimizes this away.
+#[inline]
 fn empty_buf() -> Buf {
   Box::new([])
 }
@@ -60,11 +61,11 @@ fn empty_buf() -> Buf {
 /// control corresponds to the first argument of libdeno.send().
 /// data corresponds to the second argument of libdeno.send().
 pub fn dispatch(
-  isolate: &mut Isolate,
-  control: &[u8],
-  data: &'static mut [u8],
+  isolate: &Isolate,
+  control: libdeno::deno_buf,
+  data: libdeno::deno_buf,
 ) -> (bool, Box<Op>) {
-  let base = msg::get_root_as_base(control);
+  let base = msg::get_root_as_base(&control);
   let is_sync = base.sync();
   let inner_type = base.inner_type();
   let cmd_id = base.cmd_id();
@@ -119,7 +120,7 @@ pub fn dispatch(
         msg::enum_name_any(inner_type)
       )),
     };
-    op_creator(&isolate.state.clone(), &base, data)
+    op_creator(&isolate.state, &base, data)
   };
 
   let boxed_op = Box::new(
@@ -167,18 +168,18 @@ pub fn dispatch(
 }
 
 fn op_exit(
-  _config: &Arc<IsolateState>,
+  _config: &IsolateState,
   base: &msg::Base,
-  _data: &'static mut [u8],
+  _data: libdeno::deno_buf,
 ) -> Box<Op> {
   let inner = base.inner_as_exit().unwrap();
   std::process::exit(inner.code())
 }
 
 fn op_start(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let mut builder = FlatBufferBuilder::new();
@@ -232,8 +233,7 @@ fn serialize_response(
   msg::finish_base_buffer(builder, base);
   let data = builder.finished_data();
   // println!("serialize_response {:x?}", data);
-  let vec = data.to_vec();
-  vec.into_boxed_slice()
+  data.into()
 }
 
 fn ok_future(buf: Buf) -> Box<Op> {
@@ -247,9 +247,9 @@ fn odd_future(err: DenoError) -> Box<Op> {
 
 // https://github.com/denoland/deno/blob/golang/os.go#L100-L154
 fn op_code_fetch(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_code_fetch().unwrap();
@@ -290,9 +290,9 @@ fn op_code_fetch(
 
 // https://github.com/denoland/deno/blob/golang/os.go#L156-L169
 fn op_code_cache(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_code_cache().unwrap();
@@ -309,9 +309,9 @@ fn op_code_cache(
 }
 
 fn op_chdir(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_chdir().unwrap();
@@ -323,26 +323,27 @@ fn op_chdir(
 }
 
 fn op_set_timeout(
-  isolate: &mut Isolate,
+  isolate: &Isolate,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_set_timeout().unwrap();
-  // FIXME why is timeout a double if it's cast immediately to i64?
+  // FIXME why is timeout a double if it's cast immediately to i64/u64??
   let val = inner.timeout() as i64;
-  isolate.timeout_due = if val >= 0 {
+  let timeout_due = if val >= 0 {
     Some(Instant::now() + Duration::from_millis(val as u64))
   } else {
     None
   };
+  isolate.set_timeout_due(timeout_due);
   ok_future(empty_buf())
 }
 
 fn op_set_env(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_set_env().unwrap();
@@ -356,9 +357,9 @@ fn op_set_env(
 }
 
 fn op_env(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
@@ -388,9 +389,9 @@ fn op_env(
 }
 
 fn op_fetch(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   let inner = base.inner_as_fetch().unwrap();
   let cmd_id = base.cmd_id();
@@ -399,10 +400,10 @@ fn op_fetch(
   assert!(header.is_request());
   let url = header.url().unwrap();
 
-  let body = if data.len() == 0 {
+  let body = if data.is_empty() {
     hyper::Body::empty()
   } else {
-    hyper::Body::from(Vec::from(data))
+    hyper::Body::from(Vec::from(&*data))
   };
 
   let req = msg_util::deserialize_request(header, body);
@@ -428,7 +429,6 @@ fn op_fetch(
           &msg::FetchResArgs {
             header: Some(header_off),
             body_rid: body_resource.rid,
-            ..Default::default()
           },
         );
 
@@ -478,9 +478,9 @@ macro_rules! blocking {
 }
 
 fn op_make_temp_dir(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let base = Box::new(*base);
@@ -527,9 +527,9 @@ fn op_make_temp_dir(
 }
 
 fn op_mkdir(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_mkdir().unwrap();
@@ -547,9 +547,9 @@ fn op_mkdir(
 }
 
 fn op_chmod(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_chmod().unwrap();
@@ -580,9 +580,9 @@ fn op_chmod(
 }
 
 fn op_open(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
@@ -611,9 +611,9 @@ fn op_open(
 }
 
 fn op_close(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_close().unwrap();
@@ -628,9 +628,9 @@ fn op_close(
 }
 
 fn op_shutdown(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_shutdown().unwrap();
@@ -654,9 +654,9 @@ fn op_shutdown(
 }
 
 fn op_read(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   let cmd_id = base.cmd_id();
   let inner = base.inner_as_read().unwrap();
@@ -692,9 +692,9 @@ fn op_read(
 }
 
 fn op_write(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   let cmd_id = base.cmd_id();
   let inner = base.inner_as_write().unwrap();
@@ -729,9 +729,9 @@ fn op_write(
 }
 
 fn op_remove(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_remove().unwrap();
@@ -759,9 +759,9 @@ fn op_remove(
 
 // Prototype https://github.com/denoland/deno/blob/golang/os.go#L171-L184
 fn op_read_file(
-  _config: &Arc<IsolateState>,
+  _config: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_read_file().unwrap();
@@ -793,9 +793,9 @@ fn op_read_file(
 }
 
 fn op_copy_file(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_copy_file().unwrap();
@@ -845,9 +845,9 @@ fn get_mode(_perm: &fs::Permissions) -> u32 {
 }
 
 fn op_cwd(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
@@ -871,9 +871,9 @@ fn op_cwd(
 }
 
 fn op_stat(
-  _config: &Arc<IsolateState>,
+  _config: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_stat().unwrap();
@@ -918,9 +918,9 @@ fn op_stat(
 }
 
 fn op_read_dir(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_read_dir().unwrap();
@@ -974,9 +974,9 @@ fn op_read_dir(
 }
 
 fn op_write_file(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   let inner = base.inner_as_write_file().unwrap();
   let filename = String::from(inner.filename().unwrap());
@@ -988,15 +988,15 @@ fn op_write_file(
 
   blocking!(base.sync(), || -> OpResult {
     debug!("op_write_file {} {}", filename, data.len());
-    deno_fs::write_file(Path::new(&filename), data, perm)?;
+    deno_fs::write_file(Path::new(&filename), &data, perm)?;
     Ok(empty_buf())
   })
 }
 
 fn op_rename(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_rename().unwrap();
@@ -1014,9 +1014,9 @@ fn op_rename(
 }
 
 fn op_symlink(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_symlink().unwrap();
@@ -1043,9 +1043,9 @@ fn op_symlink(
 }
 
 fn op_read_link(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_readlink().unwrap();
@@ -1076,9 +1076,9 @@ fn op_read_link(
 }
 
 fn op_repl_start(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_repl_start().unwrap();
@@ -1107,9 +1107,9 @@ fn op_repl_start(
 }
 
 fn op_repl_readline(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let inner = base.inner_as_repl_readline().unwrap();
@@ -1121,7 +1121,7 @@ fn op_repl_readline(
   // Ignore this clippy warning until this issue is addressed:
   // https://github.com/rust-lang-nursery/rust-clippy/issues/1684
   #[cfg_attr(feature = "cargo-clippy", allow(redundant_closure_call))]
-  Box::new(futures::future::result((move || {
+  blocking!(base.sync(), || -> OpResult {
     let line = resources::readline(rid, &prompt)?;
 
     let builder = &mut FlatBufferBuilder::new();
@@ -1141,13 +1141,13 @@ fn op_repl_readline(
         ..Default::default()
       },
     ))
-  })()))
+  })
 }
 
 fn op_truncate(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
 
@@ -1168,9 +1168,9 @@ fn op_truncate(
 }
 
 fn op_listen(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   if let Err(e) = state.check_net("listen") {
@@ -1234,9 +1234,9 @@ fn new_conn(cmd_id: u32, tcp_stream: TcpStream) -> OpResult {
 }
 
 fn op_accept(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   if let Err(e) = state.check_net("accept") {
@@ -1260,9 +1260,9 @@ fn op_accept(
 }
 
 fn op_dial(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   if let Err(e) = state.check_net("dial") {
@@ -1284,25 +1284,17 @@ fn op_dial(
 }
 
 fn op_metrics(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
 
-  let metrics = state.metrics.lock().unwrap();
-
   let builder = &mut FlatBufferBuilder::new();
   let inner = msg::MetricsRes::create(
     builder,
-    &msg::MetricsResArgs {
-      ops_dispatched: metrics.ops_dispatched,
-      ops_completed: metrics.ops_completed,
-      bytes_sent_control: metrics.bytes_sent_control,
-      bytes_sent_data: metrics.bytes_sent_data,
-      bytes_received: metrics.bytes_received,
-    },
+    &msg::MetricsResArgs::from(&state.metrics),
   );
   ok_future(serialize_response(
     cmd_id,
@@ -1316,9 +1308,9 @@ fn op_metrics(
 }
 
 fn op_resources(
-  _state: &Arc<IsolateState>,
+  _state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
@@ -1368,9 +1360,9 @@ fn subprocess_stdio_map(v: msg::ProcessStdio) -> std::process::Stdio {
 }
 
 fn op_run(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert!(base.sync());
   let cmd_id = base.cmd_id();
@@ -1384,19 +1376,19 @@ fn op_run(
   let args = inner.args().unwrap();
   let cwd = inner.cwd();
 
-  let mut cmd = Command::new(args.get(0));
+  let mut c = Command::new(args.get(0));
   (1..args.len()).for_each(|i| {
     let arg = args.get(i);
-    cmd.arg(arg);
+    c.arg(arg);
   });
-  cwd.map(|d| cmd.current_dir(d));
+  cwd.map(|d| c.current_dir(d));
 
-  cmd.stdin(subprocess_stdio_map(inner.stdin()));
-  cmd.stdout(subprocess_stdio_map(inner.stdout()));
-  cmd.stderr(subprocess_stdio_map(inner.stderr()));
+  c.stdin(subprocess_stdio_map(inner.stdin()));
+  c.stdout(subprocess_stdio_map(inner.stdout()));
+  c.stderr(subprocess_stdio_map(inner.stderr()));
 
   // Spawn the command.
-  let child = match cmd.spawn_async() {
+  let child = match c.spawn_async() {
     Ok(v) => v,
     Err(err) => {
       return odd_future(err.into());
@@ -1436,9 +1428,9 @@ fn op_run(
 }
 
 fn op_run_status(
-  state: &Arc<IsolateState>,
+  state: &IsolateState,
   base: &msg::Base,
-  data: &'static mut [u8],
+  data: libdeno::deno_buf,
 ) -> Box<Op> {
   assert_eq!(data.len(), 0);
   let cmd_id = base.cmd_id();
@@ -1476,7 +1468,6 @@ fn op_run_status(
         got_signal,
         exit_code: code.unwrap_or(-1),
         exit_signal: signal.unwrap_or(-1),
-        ..Default::default()
       },
     );
     Ok(serialize_response(
